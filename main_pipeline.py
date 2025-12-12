@@ -131,7 +131,13 @@ def main():
                 df[['Sentiment_Score', 'Prob_Pos', 'Prob_Neg', 'News_Volume']].fillna(0.0)
             print("   Merged Explicit FinBERT Scores.")
         # --------------------------------------
+        import numpy as np
+        df['Sentiment_Impact'] = df['Sentiment_Score'] * np.log1p(df['News_Volume'])
         
+        # 2. Calculate "Bullish Intensity" and "Bearish Intensity"
+        df['Bullish_Pressure'] = df['Prob_Pos'] * np.log1p(df['News_Volume'])
+        df['Bearish_Pressure'] = df['Prob_Neg'] * np.log1p(df['News_Volume'])
+        print(f"   Created Weighted Sentiment Impact features.")
         # --- Merge Sector Context and Calculate Beta ---
         if sector_df is not None: 
             df = df.join(sector_df, how='left') 
@@ -150,8 +156,10 @@ def main():
             'Open', 'High', 'Low', 'Close', 'Volume', 'Log_Ret', 'RSI', 'MACD', 
             'MACD_Signal', 'Volatility', 'Sentiment_Decay', 'Dividend_Yield',
             'Sector_Ret', 'Sector_Vol', 'Rolling_Beta',
-            # Add new explicit FinBERT scores to the scaling list
-            'Sentiment_Score', 'Prob_Pos', 'Prob_Neg', 'News_Volume'
+            # Add RAW scores
+            'Sentiment_Score', 'Prob_Pos', 'Prob_Neg', 'News_Volume',
+            # Add NEW Weighted Impact scores
+            'Sentiment_Impact', 'Bullish_Pressure', 'Bearish_Pressure'
         ]
 
         # Final cleanup before scaling
