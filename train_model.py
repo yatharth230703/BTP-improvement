@@ -2,7 +2,7 @@ import modal
 import os
 import sys
 from pathlib import Path
-# comment
+
 # --- Configuration ---
 APP_NAME = "fintech-research-training"
 VOLUME_NAME = "fintech-data-vol"
@@ -13,8 +13,9 @@ LOCAL_DATA_DIR = Path("data/processed")
 LOCAL_SRC_DIR = Path("src")
 
 # --- Define the Modal Image ---
+# FIX 1: Use NVIDIA Base Image to ensure CuPy/XGBoost compatibility
 image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.from_registry("nvidia/cuda:12.2.0-devel-ubuntu22.04", add_python="3.10")
     .pip_install(
         "torch",
         "pandas",
@@ -23,7 +24,7 @@ image = (
         "scikit-learn",
         "matplotlib",
         "xgboost",
-        "cupy-cuda12x"  # Added XGBoost for the ensemble
+        "cupy-cuda12x"
     )
     .add_local_python_source(str(LOCAL_SRC_DIR))
 )
@@ -41,7 +42,7 @@ def needs_upload():
 @app.function(
     image=image,
     gpu="H100",
-    timeout=7200, # Increased timeout for ensemble training
+    timeout=7200,
     volumes={REMOTE_MOUNT_PATH: volume},
 )
 def train_remote(target_stocks):
@@ -52,7 +53,7 @@ def train_remote(target_stocks):
     import matplotlib.pyplot as plt
     import numpy as np
     import pandas as pd
-    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+    from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, r2_score
     from sklearn.linear_model import LogisticRegression
     import xgboost as xgb
     import cupy as cp
@@ -63,7 +64,7 @@ def train_remote(target_stocks):
     from src.models.transformer import TimeSeriesTransformer
     from src.features.financial import create_classification_target, select_features
 
-    print(f"🚀 Starting Grand Unified Training (Weighted) on {torch.cuda.get_device_name(0)}")
+    print(f"🚀 Starting Grand Unified Training (Weighted + Tuned) on {torch.cuda.get_device_name(0)}")
     
     BATCH_SIZE = 64
     EPOCHS = 30
@@ -107,28 +108,21 @@ def train_remote(target_stocks):
         val_df = df_selected.iloc[train_size : train_size + val_size]
         test_df = df_selected.iloc[train_size + val_size :]
         
-        # --- FIX: CALCULATE CLASS WEIGHTS ---
-        # Count classes to handle imbalance
+        # Calculate Class Weights
         n_total = len(train_df)
         n_0 = len(train_df[train_df['Target_Direction'] == 0])
         n_1 = len(train_df[train_df['Target_Direction'] == 1])
         
         if n_1 == 0:
-            print("⚠️ Warning: No 'Buy' signals in training data. Skipping stock.")
+            print("⚠️ Warning: No 'Buy' signals. Skipping.")
             continue
 
-        # Weights for Neural Networks (Inverse Frequency)
-        # weight = Total / (2 * Count)
         w0 = n_total / (2 * n_0)
         w1 = n_total / (2 * n_1)
         class_weights = torch.tensor([w0, w1], dtype=torch.float32).cuda()
-        
-        # Weight for XGBoost (Ratio of Neg/Pos)
         xgb_scale_pos_weight = n_0 / n_1
         
-        print(f"⚖️ Class Balance: 0s={n_0}, 1s={n_1}")
-        print(f"⚖️ Calculated Weights: Class 0={w0:.2f}, Class 1={w1:.2f}")
-        # ------------------------------------
+        print(f"⚖️ Class Balance: 0s={n_0}, 1s={n_1} | Weights: 0={w0:.2f}, 1={w1:.2f}")
         
         # Save temp CSVs
         temp_train_path = stock_dir / "temp_ensemble_train.csv"
@@ -153,7 +147,6 @@ def train_remote(target_stocks):
         # --- 2. TRAIN EXPERT A: LSTM (Weighted) ---
         print("\n🥋 Training Expert A: Dual-Branch LSTM...")
         model_lstm = DualBranchLSTM(input_dim=input_dim, output_dim=2).cuda()
-        # FIX: Pass weights to loss function
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = optim.Adam(model_lstm.parameters(), lr=LEARNING_RATE)
         
@@ -195,51 +188,49 @@ def train_remote(target_stocks):
                 flat_X = X_b.view(X_b.size(0), -1).numpy()
                 X_list.append(flat_X)
                 y_list.append(y_b.numpy())
+            if not X_list: return np.array([]), np.array([])
             return np.concatenate(X_list), np.concatenate(y_list)
 
         X_train_np, y_train_np = get_numpy_data(train_loader)
-        X_val_np, y_val_np = get_numpy_data(val_loader)
         
-        # FIX: Add scale_pos_weight parameter
         xgb_model = xgb.XGBClassifier(
             n_estimators=100, 
             learning_rate=0.1, 
             max_depth=5, 
             device="cuda",
-            scale_pos_weight=xgb_scale_pos_weight # <--- The critical fix for XGBoost
+            scale_pos_weight=xgb_scale_pos_weight
         )
         xgb_model.fit(X_train_np, y_train_np)
         
-        # --- 5. META-LEARNER & THRESHOLD OPTIMIZATION ---
+        # --- 5. META-LEARNER & THRESHOLD TUNING ---
         print("🧠 Training Meta-Learner & Tuning Threshold...")
         
         model_lstm.eval()
         model_transformer.eval()
         
+        # FIX 2: Initialize lists outside the loop to prevent UnboundLocalError
         meta_X_val = []
         meta_y_val = []
         
-        # Collect Predictions from Experts on Validation Set
         with torch.no_grad():
             for X_b, y_b in val_loader:
                 X_cuda = X_b.cuda()
                 
-                # Expert A (LSTM)
                 p_lstm = torch.softmax(model_lstm(X_cuda), dim=1)[:, 1].cpu().numpy()
-                
-                # Expert B (Transformer)
                 p_trans = torch.softmax(model_transformer(X_cuda), dim=1)[:, 1].cpu().numpy()
                 
-                # Expert C (XGBoost) - Convert to CuPy for GPU prediction
                 flat_X_np = X_b.view(X_b.size(0), -1).numpy()
                 flat_X_cp = cp.asarray(flat_X_np)
                 p_xgb = xgb_model.predict_proba(flat_X_cp)[:, 1]
                 
-                # Stack features: [LSTM_Prob, Trans_Prob, XGB_Prob]
                 stacked = np.column_stack((p_lstm, p_trans, p_xgb))
                 meta_X_val.append(stacked)
                 meta_y_val.append(y_b.numpy())
-                
+        
+        if len(meta_X_val) == 0:
+            print("⚠️ Validation Set empty. Skipping.")
+            continue
+            
         meta_X_val = np.concatenate(meta_X_val)
         meta_y_val = np.concatenate(meta_y_val)
         
@@ -247,41 +238,33 @@ def train_remote(target_stocks):
         meta_learner = LogisticRegression(class_weight='balanced')
         meta_learner.fit(meta_X_val, meta_y_val)
         
-        # --- NEW: Dynamic Threshold Tuning (Maximizing G-Mean) ---
+        # Find Optimal Threshold (Maximizing G-Mean)
         val_probs = meta_learner.predict_proba(meta_X_val)[:, 1]
-        
         best_threshold = 0.5
         best_gmean = 0.0
         
-        # Grid search for the best threshold between 0.3 and 0.7
         for thresh in np.arange(0.3, 0.7, 0.01):
             preds = (val_probs >= thresh).astype(int)
             tn, fp, fn, tp = confusion_matrix(meta_y_val, preds).ravel()
-            
-            # Sensitivity (Recall) and Specificity
             sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
             specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-            
-            # Geometric Mean of Sensitivity and Specificity
             gmean = np.sqrt(sensitivity * specificity)
-            
             if gmean > best_gmean:
                 best_gmean = gmean
                 best_threshold = thresh
-                
-        print(f"   ⚖️ Optimal Decision Threshold Found: {best_threshold:.4f} (G-Mean: {best_gmean:.4f})")
         
-        # --- 6. FINAL EVALUATION ON TEST SET ---
+        print(f"   ⚖️ Optimal Threshold: {best_threshold:.2f} (G-Mean: {best_gmean:.4f})")
+        
+        # --- 6. FINAL EVALUATION ---
         print("📊 Final Evaluation on Test Set...")
         
+        # FIX 2: Initialize lists outside the loop
         meta_X_test = []
         meta_y_test = []
         
-        # Collect Predictions from Experts on Test Set
         with torch.no_grad():
             for i, (X_b, y_b) in enumerate(test_loader):
                 X_cuda = X_b.cuda()
-                
                 p_lstm = torch.softmax(model_lstm(X_cuda), dim=1)[:, 1].cpu().numpy()
                 p_trans = torch.softmax(model_transformer(X_cuda), dim=1)[:, 1].cpu().numpy()
                 
@@ -293,33 +276,36 @@ def train_remote(target_stocks):
                 meta_X_test.append(stacked)
                 meta_y_test.append(y_b.numpy())
 
+        if len(meta_X_test) == 0:
+            print("⚠️ Test Set empty. Skipping.")
+            continue
+
         meta_X_test = np.concatenate(meta_X_test)
         meta_y_test = np.concatenate(meta_y_test)
         
-        # Get Final Probabilities
-        test_probs = meta_learner.predict_proba(meta_X_test)[:, 1]
+        # 1. Get Raw Probabilities
+        raw_test_probs = meta_learner.predict_proba(meta_X_test)[:, 1]
         
-        # Apply the Optimized Threshold
-        final_preds = (test_probs >= best_threshold).astype(int)
+        # 2. FIX 3: Apply Signal Smoothing (EMA)
+        smoothed_probs = pd.Series(raw_test_probs).ewm(span=3).mean().values
         
-        # Metrics Calculation
+        # 3. Apply Optimal Threshold
+        final_preds = (smoothed_probs >= best_threshold).astype(int)
+        
         acc = accuracy_score(meta_y_test, final_preds)
         f1 = f1_score(meta_y_test, final_preds)
+        r2 = r2_score(meta_y_test, smoothed_probs)
         
-        # R-Squared (on Probabilities)
-        from sklearn.metrics import r2_score
-        r2 = r2_score(meta_y_test, test_probs)
-        
-        # Confusion Matrix
         cm = confusion_matrix(meta_y_test, final_preds)
         print(f"   Confusion Matrix: \n{cm}")
         
         # Visualization
         plt.figure(figsize=(12, 6))
-        plt.plot(meta_y_test, label='Actual (1=Up)', marker='.', linestyle='', alpha=0.5, color='black')
-        plt.plot(test_probs, label='Ensemble Prob', color='blue', alpha=0.7)
+        plt.plot(meta_y_test, label='Actual (1=Up)', marker='.', linestyle='', alpha=0.3, color='black')
+        plt.plot(raw_test_probs, label='Raw Prob', color='lightblue', alpha=0.5, linewidth=1)
+        plt.plot(smoothed_probs, label='Smoothed Prob (EMA)', color='blue', linewidth=2)
         plt.axhline(y=best_threshold, color='r', linestyle='--', label=f'Threshold ({best_threshold:.2f})')
-        plt.title(f"{ticker}: Ensemble Prediction (Weighted & Tuned)")
+        plt.title(f"{ticker}: Ensemble Prediction (Weighted & Smoothed)")
         plt.legend()
         
         plot_path = REMOTE_MODEL_PATH / f"{ticker}_ensemble_prediction.png"
@@ -332,6 +318,7 @@ def train_remote(target_stocks):
         print(f"   Ensemble R2 Score: {r2:.4f}")
         
         results[ticker] = {"Accuracy": acc, "F1": f1, "R2": r2}
+
     print("\n🏆 GRAND UNIFIED LEADERBOARD")
     print(f"{'Ticker':<12} | {'Accuracy':<10} | {'F1 Score':<10} | {'R2 Score':<10}")
     print("-" * 55)
@@ -339,7 +326,6 @@ def train_remote(target_stocks):
         print(f"{t:<12} | {m['Accuracy']:.2%}     | {m['F1']:.4f}     | {m['R2']:.4f}")
         
     return results
-
 
 # --- Local Entrypoint ---
 @app.local_entrypoint()

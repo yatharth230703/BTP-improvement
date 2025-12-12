@@ -4,7 +4,8 @@ from src.config import RAW_DATA_DIR, PROCESSED_DATA_DIR, TARGET_STOCKS, TRAIN_ST
 from src.features.financial import (
     calculate_technical_indicators, 
     scale_data, 
-    create_classification_target
+    create_classification_target,
+    calculate_rolling_beta
 )
 from src.features.corporate import apply_corporate_actions
 from src.features.news import process_sentiment
@@ -21,27 +22,24 @@ def process_sector_index():
         idx_df['Date'] = pd.to_datetime(idx_df['Date'])
         idx_df.set_index('Date', inplace=True)
         
-        # Handle timezone if present
+        # Handle timezone
         if idx_df.index.tz is not None:
             idx_df.index = idx_df.index.tz_localize(None)
             
-        # Clean numeric columns (sometimes they have commas like "25,000.00")
+        # Clean numeric columns (assuming common cleaning)
         for col in ['Price', 'Open', 'High', 'Low']:
-            if idx_df[col].dtype == object:
-                idx_df[col] = idx_df[col].str.replace(',', '').astype(float)
+            if col in idx_df.columns and idx_df[col].dtype == object:
+                idx_df[col] = idx_df[col].str.replace(',', '', regex=False).astype(float)
         
-        # Rename 'Price' to 'Close' for consistency if needed
         if 'Price' in idx_df.columns:
             idx_df.rename(columns={'Price': 'Close'}, inplace=True)
             
         # Calculate Sector Signals
-        # We perform simple feature engineering for the sector
         idx_df['Sector_Ret'] = idx_df['Close'].pct_change()
         idx_df['Sector_Vol'] = idx_df['Sector_Ret'].rolling(window=20).std()
-        idx_df['Sector_RSI'] = calculate_technical_indicators(idx_df)['RSI'] # Re-use our func
         
-        # Select only the features we want to inject into other stocks
-        return idx_df[['Sector_Ret', 'Sector_Vol', 'Sector_RSI']]
+        # Select only the features we want to inject
+        return idx_df[['Sector_Ret', 'Sector_Vol']]
         
     except Exception as e:
         print(f"⚠️ Warning: Could not process Sector Index. Error: {e}")
@@ -87,45 +85,49 @@ def main():
         # A. Apply Corporate Actions
         df = apply_corporate_actions(df, corp_df, ticker)
         
-        # B. Financial Feature Engineering
+        # B. Financial Feature Engineering (RSI, MACD, Log_Ret)
         df = calculate_technical_indicators(df)
         
         # C. Merge Sentiment
         df = df.join(sentiment_series['Sentiment_Decay'], how='left')
         df['Sentiment_Decay'].fillna(0, inplace=True)
         
-        # --- NEW: Merge Sector Context ---
+        # --- NEW: Merge Sector Context and Calculate Beta ---
         if sector_df is not None:
             df = df.join(sector_df, how='left')
-            # Forward fill sector data for any missing days (holidays)
-            df[['Sector_Ret', 'Sector_Vol', 'Sector_RSI']] = df[['Sector_Ret', 'Sector_Vol', 'Sector_RSI']].ffill()
-            df.dropna(inplace=True) # Drop initial rows where sector data might be NaN due to windows
-        # ---------------------------------
+            df[['Sector_Ret', 'Sector_Vol']] = df[['Sector_Ret', 'Sector_Vol']].ffill()
+            
+            # Calculate the explicit Beta factor (requires Log_Ret and Sector_Ret)
+            df = calculate_rolling_beta(df, window=60)
+            print(f"   Beta Calculated.")
+        # ---------------------------------------------------
         
         # D. Target Creation (Triple-Barrier)
         df = create_classification_target(df, barrier_multiplier=0.5)
         
         # E. Scaling
-        # Add new sector features to scaling list
         features_to_scale = ['Open', 'High', 'Low', 'Close', 'Volume', 
                              'Log_Ret', 'RSI', 'MACD', 'MACD_Signal', 
                              'Volatility', 'Sentiment_Decay', 'Dividend_Yield',
-                             'Sector_Ret', 'Sector_Vol', 'Sector_RSI'] # <-- Added here
+                             'Sector_Ret', 'Sector_Vol', 'Rolling_Beta']
         
+        df.dropna(inplace=True) 
+
         df, scaler = scale_data(df, features_to_scale)
-        print(f"   ⚖️ Scaled data for {ticker}. Added Sector Context.")
+        print(f"   ⚖️ Scaled data for {ticker}. Target direction created.")
         
         # F. Visualization
         plot_price_vs_sentiment(df.copy(), ticker)
         plot_correlation_heatmap(df.copy(), ticker)
         
-        # G. Save
+        # G. Save the FINAL, FULL SCALED & CLASSIFIED Data
         stock_dir = os.path.join(PROCESSED_DATA_DIR, ticker)
         os.makedirs(stock_dir, exist_ok=True)
+
         df.to_csv(os.path.join(stock_dir, 'full_cleaned.csv'))
         print(f"✅ Saved FULL SCALED data to {stock_dir}/full_cleaned.csv")
         
-    print("Pipeline Complete. Local data ready for upload.")
+    print("Pipeline Complete. Local data is now ready for upload.")
 
 if __name__ == "__main__":
     main()

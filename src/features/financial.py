@@ -105,3 +105,27 @@ def select_features(df, target_col='Target_Direction', n_features=10):
     
     # Return dataframe with only selected features + Target
     return df[selected_cols + [target_col]]
+
+def calculate_rolling_beta(df, window=60):
+    """
+    Calculates the Rolling Beta of the stock relative to the Sector Index.
+    Beta = Covariance(Stock_Ret, Sector_Ret) / Variance(Sector_Ret)
+    """
+    # Ensure Sector_Ret exists (it was merged in main_pipeline)
+    if 'Sector_Ret' not in df.columns:
+        return df
+        
+    # 1. Calculate Rolling Covariance
+    # We use a 60-day window (approx 3 trading months) to capture medium-term sensitivity
+    rolling_cov = df['Log_Ret'].rolling(window=window).cov(df['Sector_Ret'])
+    
+    # 2. Calculate Rolling Variance of the Sector
+    rolling_var = df['Sector_Ret'].rolling(window=window).var()
+    
+    # 3. Compute Beta
+    df['Rolling_Beta'] = rolling_cov / rolling_var
+    
+    # Forward fill initialization NaNs to prevent data loss
+    df['Rolling_Beta'] = df['Rolling_Beta'].ffill().fillna(1.0) # Default to 1.0 (market performer)
+    
+    return df
