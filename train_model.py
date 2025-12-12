@@ -12,6 +12,7 @@ REMOTE_MODEL_PATH = REMOTE_MOUNT_PATH / "models"
 LOCAL_DATA_DIR = Path("data/processed")
 LOCAL_SRC_DIR = Path("src")
 
+# --- Define the Modal Image ---
 image = (
     modal.Image.from_registry("nvidia/cuda:12.2.0-devel-ubuntu22.04", add_python="3.10")
     .pip_install(
@@ -27,13 +28,16 @@ image = (
     .add_local_python_source(str(LOCAL_SRC_DIR))
 )
 
+# --- Define the App & Volume ---
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
+# --- Helper: Data Check ---
 @app.function(volumes={REMOTE_MOUNT_PATH: volume})
 def needs_upload():
     return not (REMOTE_DATA_PATH).exists()
 
+# --- The Remote Training Function ---
 @app.function(
     image=image,
     gpu="H100",
@@ -50,17 +54,17 @@ def train_remote(target_stocks):
     import pandas as pd
     from sklearn.metrics import r2_score, mean_squared_error 
     from sklearn.linear_model import LinearRegression 
-    from sklearn.preprocessing import RobustScaler # FIX 1: RobustScaler
+    from sklearn.preprocessing import MinMaxScaler
     import xgboost as xgb
     import cupy as cp
     import sys
-    from sklearn.preprocessing import MinMaxScaler
+    
     from src.models.dataset import FinancialDataset
     from src.models.lstm import DualBranchLSTM
     from src.models.transformer import TimeSeriesTransformer
     from src.features.financial import create_regression_target as create_target, select_features
 
-    print(f"🚀 Starting Grand Unified Training (ROBUST REGRESSION) on {torch.cuda.get_device_name(0)}")
+    print(f"🚀 Starting Grand Unified Training (NNLS ENSEMBLE) on {torch.cuda.get_device_name(0)}")
     
     BATCH_SIZE = 64
     EPOCHS = 30
@@ -103,27 +107,28 @@ def train_remote(target_stocks):
         val_df = df_selected.iloc[train_size : train_size + val_size].copy()
         test_df = df_selected.iloc[train_size + val_size :].copy()
         
-        from sklearn.preprocessing import MinMaxScaler
-
+        # --- FIX: MINMAX SCALING FOR PRICE ---
+        # Neural networks need 0-1 scaling for prices to avoid saturation/explosion
         TARGET_COL = 'Target_Close'
+        
         target_scaler = MinMaxScaler(feature_range=(0, 1))
         
         train_df[TARGET_COL] = target_scaler.fit_transform(train_df[[TARGET_COL]])
         val_df[TARGET_COL] = target_scaler.transform(val_df[[TARGET_COL]])
         test_df[TARGET_COL] = target_scaler.transform(test_df[[TARGET_COL]])
         
-        print(f"   ⚖️ Target '{TARGET_COL}' Scaled (MinMax). Range: 0-1")        
+        print(f"   ⚖️ Target '{TARGET_COL}' Scaled (MinMax). Range: 0-1")
+        
         # Save temp CSVs
         temp_train_path = stock_dir / "temp_ensemble_train.csv"
         temp_val_path = stock_dir / "temp_ensemble_val.csv"
         temp_test_path = stock_dir / "temp_ensemble_test.csv"
         
-        
-
         train_df.to_csv(temp_train_path)
         val_df.to_csv(temp_val_path)
         test_df.to_csv(temp_test_path)
         
+        # Create Datasets
         train_dataset = FinancialDataset(str(temp_train_path), sequence_length=SEQUENCE_LENGTH, target_col=TARGET_COL)
         val_dataset = FinancialDataset(str(temp_val_path), sequence_length=SEQUENCE_LENGTH, target_col=TARGET_COL)
         test_dataset = FinancialDataset(str(temp_test_path), sequence_length=SEQUENCE_LENGTH, target_col=TARGET_COL)
@@ -137,9 +142,7 @@ def train_remote(target_stocks):
         # --- 2. TRAIN EXPERT A: LSTM ---
         print("\n🥋 Training Expert A: Dual-Branch LSTM (Regression)...")
         model_lstm = DualBranchLSTM(input_dim=input_dim, output_dim=1).cuda()
-        
-        # FIX 2: HuberLoss handles outliers better than MSE
-        criterion = nn.HuberLoss(delta=1.0) 
+        criterion = nn.MSELoss() 
         optimizer = optim.Adam(model_lstm.parameters(), lr=LEARNING_RATE)
         
         for epoch in range(EPOCHS):
@@ -193,9 +196,9 @@ def train_remote(target_stocks):
         )
         xgb_model.fit(X_train_np, y_train_np)
 
-        # ... (Feature Importance Plotting logic remains the same) ...
-        print("🔍 Generating Feature Importance Plot...")
+        # ... (Feature Importance Logic) ...
         try:
+            print("🔍 Generating Feature Importance Plot...")
             feature_names = [c for c in df_selected.columns if c not in [TARGET_COL, 'Date', 'Unnamed: 0']]
             num_base_features = len(feature_names)
             importance_map = xgb_model.get_booster().get_score(importance_type='gain')
@@ -224,8 +227,8 @@ def train_remote(target_stocks):
         except Exception as e:
             print(f"   ⚠️ Could not plot feature importance: {e}")
         
-        # --- 5. META-LEARNER ---
-        print("🧠 Training Meta-Learner (Linear Regression)...")
+        # --- 5. META-LEARNER (Constrained) ---
+        print("🧠 Training Meta-Learner (Non-Negative Ensemble)...")
         
         model_lstm.eval()
         model_transformer.eval()
@@ -255,8 +258,13 @@ def train_remote(target_stocks):
         meta_X_val = np.concatenate(meta_X_val)
         meta_y_val = np.concatenate(meta_y_val)
         
-        meta_learner = LinearRegression()
+        # FIX: Use positive=True to prevent negative weights (Rogue Expert protection)
+        meta_learner = LinearRegression(positive=True) 
         meta_learner.fit(meta_X_val, meta_y_val)
+        
+        # Print the expert weights for verification
+        weights = meta_learner.coef_
+        print(f"   ⚖️ Expert Weights: LSTM={weights[0]:.2f}, Transformer={weights[1]:.2f}, XGBoost={weights[2]:.2f}")
         
         # --- 6. FINAL EVALUATION ---
         print("📊 Final Evaluation on Test Set...")
@@ -297,10 +305,9 @@ def train_remote(target_stocks):
         
         # Visualization
         plt.figure(figsize=(12, 6))
-        plt.plot(actual_values, label='Actual Log Return', alpha=0.6, color='black')
-        plt.plot(final_predictions, label='Predicted Log Return', alpha=0.8, color='blue', linewidth=2)
-        plt.axhline(y=0, color='r', linestyle='--', label='Zero Return')
-        plt.title(f"{ticker}: Ensemble Regression (Robust Scaler)")
+        plt.plot(actual_values, label='Actual Price', alpha=0.6, color='black')
+        plt.plot(final_predictions, label='Predicted Price', alpha=0.8, color='blue', linewidth=2)
+        plt.title(f"{ticker}: Price Prediction (Non-Negative Ensemble)")
         plt.legend()
         
         plot_path = REMOTE_MODEL_PATH / f"{ticker}_regression_prediction.png"
@@ -321,6 +328,7 @@ def train_remote(target_stocks):
         
     return results
 
+# --- Local Entrypoint ---
 @app.local_entrypoint()
 def main():
     print("🔄 Verifying Data...")
