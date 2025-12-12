@@ -28,16 +28,13 @@ image = (
     .add_local_python_source(str(LOCAL_SRC_DIR))
 )
 
-# --- Define the App & Volume ---
 app = modal.App(APP_NAME)
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
-# --- Helper: Data Check ---
 @app.function(volumes={REMOTE_MOUNT_PATH: volume})
 def needs_upload():
     return not (REMOTE_DATA_PATH).exists()
 
-# --- The Remote Training Function ---
 @app.function(
     image=image,
     gpu="H100",
@@ -53,8 +50,8 @@ def train_remote(target_stocks):
     import numpy as np
     import pandas as pd
     from sklearn.metrics import r2_score, mean_squared_error 
-    from sklearn.linear_model import LinearRegression 
-    from sklearn.preprocessing import MinMaxScaler
+    from sklearn.linear_model import HuberRegressor # Best performer for noisy data
+    from sklearn.preprocessing import RobustScaler
     import xgboost as xgb
     import cupy as cp
     import sys
@@ -62,9 +59,10 @@ def train_remote(target_stocks):
     from src.models.dataset import FinancialDataset
     from src.models.lstm import DualBranchLSTM
     from src.models.transformer import TimeSeriesTransformer
+    # We import create_regression_target, but we will override the logic locally to ensure Return
     from src.features.financial import create_regression_target as create_target, select_features
 
-    print(f"🚀 Starting Grand Unified Training (NNLS ENSEMBLE) on {torch.cuda.get_device_name(0)}")
+    print(f"🚀 Starting Grand Unified Training (RECONSTRUCTION PIVOT) on {torch.cuda.get_device_name(0)}")
     
     BATCH_SIZE = 64
     EPOCHS = 30
@@ -88,13 +86,20 @@ def train_remote(target_stocks):
             print(f"⚠️ Data for {ticker} not found. Skipping.")
             continue
             
-        print("🛠️ Transforming Data: Creating Regression Targets...")
+        print("🛠️ Transforming Data: Creating Log Return Targets...")
         df = pd.read_csv(full_data_path)
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
             
-        df = create_target(df) 
+        # FORCE RECALCULATION OF LOG RETURNS (To ensure we are predicting Returns, not Price)
+        # Target = ln(Price_t+1 / Price_t)
+        price_ratio = df['Close'].shift(-1) / df['Close']
+        valid_mask = (price_ratio > 0) & (price_ratio.notna())
+        df['Target_Return'] = 0.0
+        df.loc[valid_mask, 'Target_Return'] = np.log(price_ratio[valid_mask])
+        df['Target_Return'] = df['Target_Return'].replace([np.inf, -np.inf], 0.0)
+        df.dropna(inplace=True)
         
         print("⚠️ DIAGNOSTIC MODE: RFE Disabled. Using ALL engineered features.")
         df_selected = df
@@ -103,21 +108,21 @@ def train_remote(target_stocks):
         train_size = int(len(df_selected) * 0.7)
         val_size = int(len(df_selected) * 0.15)
         
+        # Copy to avoid setting with copy warning
         train_df = df_selected.iloc[:train_size].copy()
         val_df = df_selected.iloc[train_size : train_size + val_size].copy()
         test_df = df_selected.iloc[train_size + val_size :].copy()
         
-        # --- FIX: MINMAX SCALING FOR PRICE ---
-        # Neural networks need 0-1 scaling for prices to avoid saturation/explosion
-        TARGET_COL = 'Target_Close'
+        # --- SCALING: RobustScaler on Returns ---
+        # Returns are small and noisy. RobustScaler handles spikes better.
+        TARGET_COL = 'Target_Return'
         
-        target_scaler = MinMaxScaler(feature_range=(0, 1))
-        
+        target_scaler = RobustScaler()
         train_df[TARGET_COL] = target_scaler.fit_transform(train_df[[TARGET_COL]])
         val_df[TARGET_COL] = target_scaler.transform(val_df[[TARGET_COL]])
         test_df[TARGET_COL] = target_scaler.transform(test_df[[TARGET_COL]])
         
-        print(f"   ⚖️ Target '{TARGET_COL}' Scaled (MinMax). Range: 0-1")
+        print(f"   ⚖️ Target '{TARGET_COL}' Scaled (Robust).")
         
         # Save temp CSVs
         temp_train_path = stock_dir / "temp_ensemble_train.csv"
@@ -142,7 +147,7 @@ def train_remote(target_stocks):
         # --- 2. TRAIN EXPERT A: LSTM ---
         print("\n🥋 Training Expert A: Dual-Branch LSTM (Regression)...")
         model_lstm = DualBranchLSTM(input_dim=input_dim, output_dim=1).cuda()
-        criterion = nn.MSELoss() 
+        criterion = nn.HuberLoss(delta=1.0) # Robust Loss
         optimizer = optim.Adam(model_lstm.parameters(), lr=LEARNING_RATE)
         
         for epoch in range(EPOCHS):
@@ -196,10 +201,10 @@ def train_remote(target_stocks):
         )
         xgb_model.fit(X_train_np, y_train_np)
 
-        # ... (Feature Importance Logic) ...
+        # ... (Feature Importance Plotting logic) ...
         try:
             print("🔍 Generating Feature Importance Plot...")
-            feature_names = [c for c in df_selected.columns if c not in [TARGET_COL, 'Date', 'Unnamed: 0']]
+            feature_names = [c for c in df_selected.columns if c not in [TARGET_COL, 'Target_Close', 'Date', 'Unnamed: 0']]
             num_base_features = len(feature_names)
             importance_map = xgb_model.get_booster().get_score(importance_type='gain')
             agg_importance = {}
@@ -227,8 +232,8 @@ def train_remote(target_stocks):
         except Exception as e:
             print(f"   ⚠️ Could not plot feature importance: {e}")
         
-        # --- 5. META-LEARNER (Constrained) ---
-        print("🧠 Training Meta-Learner (Standard Linear Regression)...")
+        # --- 5. META-LEARNER (Huber) ---
+        print("🧠 Training Meta-Learner (Huber Regressor)...")
         
         model_lstm.eval()
         model_transformer.eval()
@@ -256,82 +261,81 @@ def train_remote(target_stocks):
         meta_X_val = np.concatenate(meta_X_val)
         meta_y_val = np.concatenate(meta_y_val)
         
-        # FIX: Revert to Standard Linear Regression.
-        # This allows the model to use an Intercept (bias correction) and Negative Weights
-        # to mathematically fix experts that are consistently wrong.
-        from sklearn.linear_model import LinearRegression
-        meta_learner = LinearRegression() 
+        # Huber Regressor handles outliers well (like Covid Crash)
+        meta_learner = HuberRegressor(epsilon=1.35, max_iter=1000)
         meta_learner.fit(meta_X_val, meta_y_val)
         
-        # Check Weights
-        weights = meta_learner.coef_
-        intercept = meta_learner.intercept_
-        print(f"   ⚖️ Expert Weights: LSTM={weights[0]:.2f}, Transformer={weights[1]:.2f}, XGBoost={weights[2]:.2f}")
-        print(f"   ⚖️ Intercept (Bias Correction): {intercept:.6f}")
-        
-        # --- 6. FINAL EVALUATION ---
-        print("📊 Final Evaluation on Test Set...")
+        # --- 6. FINAL EVALUATION (Price Reconstruction) ---
+        print("📊 Final Evaluation: Reconstructing Price from Returns...")
         
         meta_X_test = []
-        meta_y_test = []
         
         with torch.no_grad():
             for i, (X_b, y_b) in enumerate(test_loader):
                 X_cuda = X_b.cuda()
                 p_lstm = model_lstm(X_cuda).squeeze().cpu().numpy()
                 p_trans = model_transformer(X_cuda).squeeze().cpu().numpy()
-                
                 flat_X_np = X_b.view(X_b.size(0), -1).numpy()
                 flat_X_cp = cp.asarray(flat_X_np)
                 p_xgb = xgb_model.predict(flat_X_cp) 
                 
                 stacked = np.column_stack((p_lstm, p_trans, p_xgb))
                 meta_X_test.append(stacked)
-                meta_y_test.append(y_b.numpy())
 
         if len(meta_X_test) == 0:
             print("⚠️ Test Set empty. Skipping.")
             continue
 
         meta_X_test = np.concatenate(meta_X_test)
-        meta_y_test = np.concatenate(meta_y_test)
         
-        scaled_predictions = meta_learner.predict(meta_X_test)
+        # 1. Predict Log Returns (Scaled)
+        scaled_pred_returns = meta_learner.predict(meta_X_test)
         
-        # Inverse Transform
-        final_predictions = target_scaler.inverse_transform(scaled_predictions.reshape(-1, 1)).flatten()
-        actual_values = target_scaler.inverse_transform(meta_y_test.reshape(-1, 1)).flatten()
+        # 2. Inverse Scale to get Real Log Returns
+        pred_log_returns = target_scaler.inverse_transform(scaled_pred_returns.reshape(-1, 1)).flatten()
         
-        r2 = r2_score(actual_values, final_predictions)
-        mse = mean_squared_error(actual_values, final_predictions)
+        # 3. RECONSTRUCT PRICE
+        # Get base prices from Test Set (Sequence Length offset)
+        n_preds = len(pred_log_returns)
+        # Note: test_df has the dates/prices. We must align them correctly.
+        # X[i] contains data up to t. Target is Return(t->t+1).
+        # So we apply Return to Price[t].
+        base_prices = test_df['Close'].values[SEQUENCE_LENGTH-1 : SEQUENCE_LENGTH-1 + n_preds]
+        
+        predicted_prices = base_prices * np.exp(pred_log_returns)
+        actual_future_prices = test_df['Close'].values[SEQUENCE_LENGTH : SEQUENCE_LENGTH + n_preds]
+        
+        # --- METRICS ON PRICE ---
+        r2 = r2_score(actual_future_prices, predicted_prices)
+        mse = mean_squared_error(actual_future_prices, predicted_prices)
         rmse = np.sqrt(mse)
         
         # Visualization
         plt.figure(figsize=(12, 6))
-        plt.plot(actual_values, label='Actual Price', alpha=0.6, color='black')
-        plt.plot(final_predictions, label='Predicted Price', alpha=0.8, color='blue', linewidth=2)
-        plt.title(f"{ticker}: Price Prediction (Non-Negative Ensemble)")
+        plt.plot(actual_future_prices, label='Actual Price', alpha=0.6, color='black')
+        plt.plot(predicted_prices, label='Predicted Price (Reconstructed)', alpha=0.8, color='blue', linewidth=1.5)
+        plt.title(f"{ticker}: Price Prediction via Return Reconstruction")
         plt.legend()
         
-        plot_path = REMOTE_MODEL_PATH / f"{ticker}_regression_prediction.png"
+        plot_path = REMOTE_MODEL_PATH / f"{ticker}_reconstructed_prediction.png"
         plt.savefig(plot_path)
         plt.close()
         
         print(f"✅ {ticker} FINAL RESULTS:")
-        print(f"   Ensemble R2 Score: {r2:.4f}")
-        print(f"   Ensemble RMSE: {rmse:.6f}")
+        print(f"   Ensemble R2 Score (Price): {r2:.4f}")
+        print(f"   Ensemble RMSE (Price): {rmse:.4f}")
         
         results[ticker] = {"R2": r2, "RMSE": rmse}
 
-    print("\n🏆 GRAND UNIFIED REGRESSION LEADERBOARD")
+    print("\n🏆 GRAND UNIFIED LEADERBOARD (PRICE RECONSTRUCTION)")
     print(f"{'Ticker':<12} | {'R2 Score':<10} | {'RMSE':<10}")
     print("-" * 35)
     for t, m in results.items():
-        print(f"{t:<12} | {m['R2']:.4f}     | {m['RMSE']:.6f}")
+        print(f"{t:<12} | {m['R2']:.4f}     | {m['RMSE']:.4f}")
         
     return results
 
-# --- Local Entrypoint ---
+# ... Local Entrypoint ...
 @app.local_entrypoint()
 def main():
     print("🔄 Verifying Data...")
