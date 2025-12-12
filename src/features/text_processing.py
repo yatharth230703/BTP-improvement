@@ -1,77 +1,75 @@
 import pandas as pd
 import numpy as np
 import torch
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from tqdm import tqdm
 import os
 
-def generate_finbert_embeddings(news_path, output_path, model_name="ProsusAI/finbert", batch_size=32):
+def generate_finbert_scores(news_path, output_path, model_name="ProsusAI/finbert", batch_size=32):
     """
-    Generates daily semantic embeddings using a specified FinBERT model.
+    Generates Daily Sentiment SCORES (Pos, Neg, Neu) instead of Embeddings.
+    Matches the methodology of Karadas et al. (2025).
     """
-    print(f"🚀 Initializing Model: {model_name}...")
+    print(f"🚀 Initializing FinBERT for Scoring: {model_name}...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # Load specific tokenizer and model
     try:
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name).to(device)
+        # FIX: Use SequenceClassification to get probabilities, not just embeddings
+        model = AutoModelForSequenceClassification.from_pretrained(model_name).to(device)
         model.eval()
     except Exception as e:
-        print(f"❌ Error loading model {model_name}: {e}")
+        print(f"❌ Error loading model: {e}")
         return None
     
-    # Load Data
     print(f"📂 Loading News Data from {news_path}...")
-    if not os.path.exists(news_path):
-        print(f"❌ News file not found at {news_path}")
-        return None
-        
+    if not os.path.exists(news_path): return None
     df = pd.read_csv(news_path)
-    df['Date'] = pd.to_datetime(df['Date'])
     
-    # Combine Title and Description
-    df['Title'] = df['Title'].fillna('')
-    df['Description'] = df['Description'].fillna('')
-    df['Full_Text'] = df['Title'] + ". " + df['Description']
-    
-    # Filter short text
+    # Combine text
+    df['Full_Text'] = df['Title'].fillna('') + ". " + df['Description'].fillna('')
     df = df[df['Full_Text'].str.len() > 5]
     
     # Storage
-    all_embeddings = []
+    sentiment_scores = []
     
-    print(f"🧠 Generating Embeddings with {model_name}...")
+    print("🧠 Calculating Sentiment Probabilities...")
     texts = df['Full_Text'].tolist()
     
     with torch.no_grad():
         for i in tqdm(range(0, len(texts), batch_size)):
             batch_texts = texts[i : i + batch_size]
-            
-            # Tokenize
             inputs = tokenizer(batch_texts, return_tensors="pt", padding=True, truncation=True, max_length=128).to(device)
-            
-            # Forward pass
             outputs = model(**inputs)
             
-            # Get [CLS] embeddings
-            embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
-            all_embeddings.append(embeddings)
+            # Apply Softmax to get probabilities (Pos, Neg, Neu)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+            sentiment_scores.append(probs.cpu().numpy())
             
-    all_embeddings = np.concatenate(all_embeddings, axis=0)
-    df['embedding'] = list(all_embeddings)
+    # Flatten and assign columns
+    scores = np.concatenate(sentiment_scores, axis=0)
+    # ProsusAI/finbert labels: [Positive, Negative, Neutral] (Verify specific model config if needed)
+    df['Prob_Pos'] = scores[:, 0]
+    df['Prob_Neg'] = scores[:, 1]
+    df['Prob_Neu'] = scores[:, 2]
     
-    print("∑ Aggregating Embeddings by Date...")
-    daily_embeddings = df.groupby('Date')['embedding'].apply(lambda x: np.mean(np.vstack(x), axis=0))
+    # --- PAPER REPLICATION LOGIC ---
+    # Calculate a "Net Sentiment Score" for each article: (Pos - Neg)
+    df['Sentiment_Score'] = df['Prob_Pos'] - df['Prob_Neg']
     
-    # Convert to DataFrame
-    emb_df = pd.DataFrame(daily_embeddings.tolist(), index=daily_embeddings.index)
-    emb_df.columns = [f'emb_{i}' for i in range(emb_df.shape[1])]
+    print("∑ Aggregating Daily Sentiment...")
+    # We aggregate by taking the MEAN score and the COUNT of articles (Volume)
+    daily_stats = df.groupby('Date').agg({
+        'Sentiment_Score': 'mean',  # The average mood
+        'Prob_Pos': 'mean',
+        'Prob_Neg': 'mean',
+        'Title': 'count'            # Volume of news (Proxy for engagement)
+    })
+    
+    daily_stats.rename(columns={'Title': 'News_Volume'}, inplace=True)
     
     # Save
-    print(f"💾 Saving {model_name} Embeddings to {output_path}...")
-    # Ensure directory exists
+    print(f"💾 Saving Sentiment Scores to {output_path}...")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    emb_df.to_csv(output_path)
-    
-    return emb_df
+    daily_stats.to_csv(output_path)
+    return daily_stats

@@ -10,41 +10,31 @@ from src.features.financial import (
 from src.features.corporate import apply_corporate_actions
 from src.features.news import process_sentiment
 from src.utils.visualization import plot_price_vs_sentiment, plot_correlation_heatmap
-from sklearn.decomposition import PCA
 
-# --- Helper Function: Process Semantic Embeddings (FinBERT PCA) ---
-def process_semantic_embeddings(num_components=10):
-    """
-    Loads ProsusAI embeddings (simulated read from local storage)
-    and reduces dimensionality using PCA.
-    """
-    print(f"🧠 Loading FinBERT Embeddings for PCA (Reducing to {num_components} components)...")
-    
-    embedding_path = os.path.join(PROCESSED_DATA_DIR, 'daily_embeddings_prosus.csv')
-    
-    if not os.path.exists(embedding_path):
-        print(f"⚠️ ERROR: Embedding file not found locally. Please run 'modal volume get...' first.")
-        return pd.DataFrame() 
+# NOTE: Removed 'from sklearn.decomposition import PCA' as it is no longer needed.
 
-    # Note: If the file is empty or corrupted, this read will fail. Using a defensive try/except.
+# --- Helper Function: Process Explicit FinBERT Scores ---
+def process_sentiment_scores():
+    """
+    Loads the explicit FinBERT scores (Sentiment_Score, Prob_Pos, Prob_Neg, News_Volume).
+    """
+    print("   📊 Loading Daily FinBERT Scores...")
+    score_path = os.path.join(PROCESSED_DATA_DIR, 'daily_finbert_scores.csv')
+    
+    if not os.path.exists(score_path):
+        print("⚠️ Scores not found locally. Run 'modal volume get...' first.")
+        return pd.DataFrame()
+    
     try:
-        emb_df = pd.read_csv(embedding_path, index_col='Date', parse_dates=True)
-    except pd.errors.EmptyDataError:
-        print("⚠️ ERROR: Embedding file is empty. Skipping PCA.")
+        df = pd.read_csv(score_path, index_col='Date', parse_dates=True)
+        # Select the columns we need for the model
+        return df[['Sentiment_Score', 'Prob_Pos', 'Prob_Neg', 'News_Volume']]
+    except Exception as e:
+        print(f"⚠️ Error reading scores file: {e}")
         return pd.DataFrame()
 
-    # Run PCA
-    pca = PCA(n_components=num_components)
-    principal_components = pca.fit_transform(emb_df.fillna(0)) # Fillna 0 for safety before PCA
-    
-    # Create output DataFrame
-    pca_df = pd.DataFrame(data=principal_components, index=emb_df.index)
-    pca_df.columns = [f'Semantic_PCA_{i+1}' for i in range(num_components)]
-    
-    print(f"    PCA Variance Explained: {pca.explained_variance_ratio_.sum():.2%}")
-    return pca_df
-
 # --- Helper Function: Process Sector Index (Nifty Bank) ---
+# (This remains unchanged as it is a working and necessary feature)
 def process_sector_index():
     """
     Loads and processes the Nifty Bank Index data.
@@ -93,7 +83,7 @@ def main():
         print(f"Error: {e}. Please ensure CSVs are in data/raw/")
         return
 
-    # Check if news_df was successfully loaded before passing to process_sentiment
+    # Check if news_df was successfully loaded
     if news_df is None:
         print("Error: News data failed to load.")
         return
@@ -101,14 +91,9 @@ def main():
     sentiment_series = process_sentiment(news_df, TRAIN_START, TEST_END)
     sector_df = process_sector_index()
     
-    # --- NEW: Process Embeddings ---
-    pca_df = process_semantic_embeddings(num_components=10)
-    # -------------------------------
-
-    # FIX 2: Initialize pca_cols outside the loop
-    pca_cols = []
-    if not pca_df.empty:
-        pca_cols = [col for col in pca_df.columns if 'Semantic_PCA' in col]
+    # --- Load Explicit FinBERT Scores ---
+    sentiment_score_df = process_sentiment_scores()
+    # ------------------------------------
 
     # 2. Process Each Stock
     for ticker in TARGET_STOCKS:
@@ -134,21 +119,21 @@ def main():
         # B. Financial Feature Engineering (RSI, MACD, Log_Ret)
         df = calculate_technical_indicators(df)
         
-        # C. Merge Sentiment
+        # C. Merge Traditional Sentiment
         df = df.join(sentiment_series['Sentiment_Decay'], how='left')
         df['Sentiment_Decay'].fillna(0, inplace=True)
         
-        # --- NEW: Merge PCA Embeddings ---
-        if not pca_df.empty:
-            df = df.join(pca_df, how='left')
-            # Fill NaN for days without news (Semantic_PCA_x) with zero vector
-            df[pca_cols] = df[pca_cols].fillna(0.0) 
-            print(f"   Merged {len(pca_cols)} PCA Semantic Features.")
-        # ----------------------------------
+        # --- Merge Explicit FinBERT Scores ---
+        if not sentiment_score_df.empty:
+            df = df.join(sentiment_score_df, how='left')
+            # Fill days with no news with 0 (Neutral score, 0 volume)
+            df[['Sentiment_Score', 'Prob_Pos', 'Prob_Neg', 'News_Volume']] = \
+                df[['Sentiment_Score', 'Prob_Pos', 'Prob_Neg', 'News_Volume']].fillna(0.0)
+            print("   Merged Explicit FinBERT Scores.")
+        # --------------------------------------
         
         # --- Merge Sector Context and Calculate Beta ---
         if sector_df is not None: 
-            # Indentation fixed here
             df = df.join(sector_df, how='left') 
             df[['Sector_Ret', 'Sector_Vol']] = df[['Sector_Ret', 'Sector_Vol']].ffill()
             
@@ -164,13 +149,12 @@ def main():
         features_to_scale = [
             'Open', 'High', 'Low', 'Close', 'Volume', 'Log_Ret', 'RSI', 'MACD', 
             'MACD_Signal', 'Volatility', 'Sentiment_Decay', 'Dividend_Yield',
-            'Sector_Ret', 'Sector_Vol', 'Rolling_Beta'
+            'Sector_Ret', 'Sector_Vol', 'Rolling_Beta',
+            # Add new explicit FinBERT scores to the scaling list
+            'Sentiment_Score', 'Prob_Pos', 'Prob_Neg', 'News_Volume'
         ]
-        # Dynamically add PCA features to scaling list
-        # FIX 3: Corrected indentation for extend() to be outside the 'if' block.
-        if pca_cols:
-            features_to_scale.extend(pca_cols) 
 
+        # Final cleanup before scaling
         df.dropna(inplace=True) 
 
         df, scaler = scale_data(df, features_to_scale)

@@ -23,32 +23,18 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     timeout=7200, # Increased timeout for two passes
     volumes={REMOTE_MOUNT_PATH: volume}
 )
+
 def generate_remote():
-    from src.features.text_processing import generate_finbert_embeddings
+    from src.features.text_processing import generate_finbert_scores # <--- Changed function name
     
     news_file = REMOTE_MOUNT_PATH / "raw_upload" / "Enriched_IndianFinancialNews.csv"
+    output_file = REMOTE_MOUNT_PATH / "processed" / "daily_finbert_scores.csv" # <--- New filename
     
     if not news_file.exists():
-        print(f"❌ News file not found at {news_file}. Please run the upload step first.")
+        print("❌ News file missing.")
         return
 
-    # --- Pass 1: Standard ProsusAI FinBERT ---
-    print("\n🔹 STARTING PASS 1: ProsusAI/finbert")
-    output_prosus = REMOTE_MOUNT_PATH / "processed" / "daily_embeddings_prosus.csv"
-    generate_finbert_embeddings(
-        str(news_file), 
-        str(output_prosus), 
-        model_name="ProsusAI/finbert"
-    )
-    
-    # --- Pass 2: Indian Market Fine-Tuned FinBERT ---
-    print("\n🔸 STARTING PASS 2: kdave/FineTuned_Finbert")
-    output_kdave = REMOTE_MOUNT_PATH / "processed" / "daily_embeddings_kdave.csv"
-    generate_finbert_embeddings(
-        str(news_file), 
-        str(output_kdave), 
-        model_name="kdave/FineTuned_Finbert"
-    )
+    generate_finbert_scores(str(news_file), str(output_file))
 
 @app.local_entrypoint()
 def main():
