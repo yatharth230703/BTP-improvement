@@ -228,7 +228,7 @@ def train_remote(target_stocks):
             print(f"   ⚠️ Could not plot feature importance: {e}")
         
         # --- 5. META-LEARNER (Constrained) ---
-        print("🧠 Training Meta-Learner (Ridge: No Intercept)...")
+        print("🧠 Training Meta-Learner (Standard Linear Regression)...")
         
         model_lstm.eval()
         model_transformer.eval()
@@ -239,10 +239,8 @@ def train_remote(target_stocks):
         with torch.no_grad():
             for X_b, y_b in val_loader:
                 X_cuda = X_b.cuda()
-                
                 p_lstm = model_lstm(X_cuda).squeeze().cpu().numpy()
                 p_trans = model_transformer(X_cuda).squeeze().cpu().numpy()
-                
                 flat_X_np = X_b.view(X_b.size(0), -1).numpy()
                 flat_X_cp = cp.asarray(flat_X_np)
                 p_xgb = xgb_model.predict(flat_X_cp) 
@@ -258,15 +256,18 @@ def train_remote(target_stocks):
         meta_X_val = np.concatenate(meta_X_val)
         meta_y_val = np.concatenate(meta_y_val)
         
-        # FIX: fit_intercept=False forces the model to use the experts for the full price value.
-        # FIX: alpha=0.05 relaxes the penalty so weights can sum to ~1.0.
-        from sklearn.linear_model import Ridge
-        meta_learner = Ridge(alpha=0.05, positive=True, fit_intercept=False) 
+        # FIX: Revert to Standard Linear Regression.
+        # This allows the model to use an Intercept (bias correction) and Negative Weights
+        # to mathematically fix experts that are consistently wrong.
+        from sklearn.linear_model import LinearRegression
+        meta_learner = LinearRegression() 
         meta_learner.fit(meta_X_val, meta_y_val)
         
-        # Check Weights again (Sum should now be close to 1.0)
+        # Check Weights
         weights = meta_learner.coef_
-        print(f"   ⚖️ Expert Weights: LSTM={weights[0]:.2f}, Transformer={weights[1]:.2f}, XGBoost={weights[2]:.2f} (Sum: {weights.sum():.2f})")
+        intercept = meta_learner.intercept_
+        print(f"   ⚖️ Expert Weights: LSTM={weights[0]:.2f}, Transformer={weights[1]:.2f}, XGBoost={weights[2]:.2f}")
+        print(f"   ⚖️ Intercept (Bias Correction): {intercept:.6f}")
         
         # --- 6. FINAL EVALUATION ---
         print("📊 Final Evaluation on Test Set...")
