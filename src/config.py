@@ -11,7 +11,7 @@ os.makedirs(PROCESSED_DATA_DIR, exist_ok=True)
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 # Date Limits (Strictly excluding 2020)
-TRAIN_START = '2015-01-01' # Adjust based on how far back you want to go
+TRAIN_START = '2008-01-01' # Adjust based on how far back you want to go
 TRAIN_END = '2018-12-31'
 TEST_START = '2019-01-01'
 TEST_END = '2019-12-31' 

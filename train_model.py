@@ -228,7 +228,7 @@ def train_remote(target_stocks):
             print(f"   ⚠️ Could not plot feature importance: {e}")
         
         # --- 5. META-LEARNER (Constrained) ---
-        print("🧠 Training Meta-Learner (Non-Negative Ensemble)...")
+        print("🧠 Training Meta-Learner (Ridge: No Intercept)...")
         
         model_lstm.eval()
         model_transformer.eval()
@@ -258,13 +258,15 @@ def train_remote(target_stocks):
         meta_X_val = np.concatenate(meta_X_val)
         meta_y_val = np.concatenate(meta_y_val)
         
-        # FIX: Use positive=True to prevent negative weights (Rogue Expert protection)
-        meta_learner = LinearRegression(positive=True) 
+        # FIX: fit_intercept=False forces the model to use the experts for the full price value.
+        # FIX: alpha=0.05 relaxes the penalty so weights can sum to ~1.0.
+        from sklearn.linear_model import Ridge
+        meta_learner = Ridge(alpha=0.05, positive=True, fit_intercept=False) 
         meta_learner.fit(meta_X_val, meta_y_val)
         
-        # Print the expert weights for verification
+        # Check Weights again (Sum should now be close to 1.0)
         weights = meta_learner.coef_
-        print(f"   ⚖️ Expert Weights: LSTM={weights[0]:.2f}, Transformer={weights[1]:.2f}, XGBoost={weights[2]:.2f}")
+        print(f"   ⚖️ Expert Weights: LSTM={weights[0]:.2f}, Transformer={weights[1]:.2f}, XGBoost={weights[2]:.2f} (Sum: {weights.sum():.2f})")
         
         # --- 6. FINAL EVALUATION ---
         print("📊 Final Evaluation on Test Set...")
