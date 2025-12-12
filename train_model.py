@@ -306,9 +306,21 @@ def train_remote(target_stocks):
         actual_future_prices = test_df['Close'].values[SEQUENCE_LENGTH : SEQUENCE_LENGTH + n_preds]
         
         # --- METRICS ON PRICE ---
+        from sklearn.metrics import accuracy_score
+        
+        # Calculate Direction: 1 if Up, -1 if Down, 0 if Flat
+        actual_move = np.sign(actual_future_prices - base_prices)
+        predicted_move = np.sign(predicted_prices - base_prices)
+        
+        # Calculate Accuracy (Hit Ratio)
+        dir_acc = accuracy_score(actual_move, predicted_move)
+        # -----------------------------------------------
+
+        # --- UPDATE METRICS ON PRICE ---
         r2 = r2_score(actual_future_prices, predicted_prices)
         mse = mean_squared_error(actual_future_prices, predicted_prices)
         rmse = np.sqrt(mse)
+
         
         # Visualization
         plt.figure(figsize=(12, 6))
@@ -324,14 +336,13 @@ def train_remote(target_stocks):
         print(f"✅ {ticker} FINAL RESULTS:")
         print(f"   Ensemble R2 Score (Price): {r2:.4f}")
         print(f"   Ensemble RMSE (Price): {rmse:.4f}")
-        
-        results[ticker] = {"R2": r2, "RMSE": rmse}
-
+        print(f"   Directional Accuracy: {dir_acc:.2%}") # Add this line
+        results[ticker] = {"R2": r2, "RMSE": rmse, "Acc": dir_acc }
     print("\n🏆 GRAND UNIFIED LEADERBOARD (PRICE RECONSTRUCTION)")
-    print(f"{'Ticker':<12} | {'R2 Score':<10} | {'RMSE':<10}")
-    print("-" * 35)
+    print(f"{'Ticker':<12} | {'R2 Score':<10} | {'RMSE':<10} | {'Accuracy':<10}" )
+    print("-" * 55)
     for t, m in results.items():
-        print(f"{t:<12} | {m['R2']:.4f}     | {m['RMSE']:.4f}")
+        print(f"{t:<12} | {m['R2']:.4f}     | {m['RMSE']:.4f} | {m['Acc']:.2%}")
         
     return results
 
