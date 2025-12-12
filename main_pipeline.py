@@ -149,8 +149,9 @@ def main():
         # -----------------------------------------------
         
         # D. Target Creation (Triple-Barrier)
-        df = create_classification_target(df, barrier_multiplier=0.5)
-        
+        # df = create_classification_target(df, barrier_multiplier=0.5)
+        from src.features.financial import create_regression_target
+        df = create_regression_target(df)
         # E. Scaling
         features_to_scale = [
             'Open', 'High', 'Low', 'Close', 'Volume', 'Log_Ret', 'RSI', 'MACD', 

@@ -129,3 +129,17 @@ def calculate_rolling_beta(df, window=60):
     df['Rolling_Beta'] = df['Rolling_Beta'].ffill().fillna(1.0) # Default to 1.0 (market performer)
     
     return df
+def create_regression_target(df):
+    """
+    Creates a Regression Target: The Closing Price of the next day.
+    Matches Karadas et al. (2025) methodology for high R2.
+    """
+    df = df.copy()
+    
+    # Target: The actual Closing Price of the NEXT day (t+1)
+    df['Target_Close'] = df['Close'].shift(-1)
+    
+    # Drop the final row (future is unknown)
+    df.dropna(inplace=True)
+    
+    return df
