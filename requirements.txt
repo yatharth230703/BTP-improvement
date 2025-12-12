@@ -1,0 +1,22 @@
+# Data Manipulation
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Technical Analysis & Finance (Optional but recommended for later)
+yfinance>=0.2.0   # Useful if we need to fetch fresh verification data
+ta>=0.10.0        # Technical Analysis Library (calculates RSI/MACD automatically if you prefer)
+
+# Machine Learning (Preparing for Milestones 4 & 5)
+scikit-learn>=1.2.0
+torch>=2.0.0      # PyTorch for the LSTM/GNN models later
+transformers>=4.30.0 # For FinBERT (Sentiment Analysis)
+
+# Utilities
+tqdm>=4.65.0      # Progress bars for long processing loops
+
+# cloud compute
+modal
