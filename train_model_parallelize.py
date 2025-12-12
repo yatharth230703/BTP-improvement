@@ -92,65 +92,80 @@ def train_remote(target_stocks):
     print(f"🚀 Starting TRIMODAL Training (Unified Pipeline) on {torch.cuda.get_device_name(0)}")
     
     # --- Dataset Definition (Preserving logic from both versions) ---
+    # --- Optimized Dataset (Pre-loads to RAM) ---
     class TrimodalDataset(Dataset):
         def __init__(self, df, img_dir, sequence_length=60, target_col='Target_Return'):
-            self.df = df
-            self.img_dir = Path(img_dir)
             self.seq_len = sequence_length
             
-            # Feature Selection
+            # 1. Prepare Numerical Data
             drop_cols = [target_col, 'Target_Close', 'Unnamed: 0']
-            feature_cols = [c for c in self.df.columns if c not in drop_cols]
+            feature_cols = [c for c in df.columns if c not in drop_cols]
+            self.features = torch.tensor(df[feature_cols].values, dtype=torch.float32)
+            self.targets = torch.tensor(df[target_col].values, dtype=torch.float32)
+            self.index_dates = df.index
             
-            self.features = self.df[feature_cols].values.astype(np.float32)
-            self.targets = self.df[target_col].values.astype(np.float32)
-            self.index_dates = self.df.index
+            # 2. Pre-load Images into RAM (The Speedup Fix)
+            print(f"   ⚡ Pre-loading images into RAM for speed...")
+            self.img_tensors = []
+            self.valid_indices = []
             
-            # Standard Image Transforms
-            self.transform = transforms.Compose([
+            transform = transforms.Compose([
                 transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
             ])
             
-            # Align Data: Ensure image exists for the sequence end date
-            self.valid_indices = []
-            for i in range(self.seq_len, len(self.df)):
+            img_dir_path = Path(img_dir)
+            
+            # Loop once and cache everything
+            for i in range(self.seq_len, len(df)):
                 date_str = self.index_dates[i].strftime('%Y-%m-%d')
-                # Try GAF first, fall back to standard if needed (based on generation script)
-                if (self.img_dir / f"{date_str}.png").exists():
-                    self.valid_indices.append(i)
-                elif (self.img_dir / f"{date_str}_gaf.png").exists():
-                     self.valid_indices.append(i)
+                
+                # Check for image existence
+                img_path = img_dir_path / f"{date_str}.png"
+                if not img_path.exists():
+                    img_path = img_dir_path / f"{date_str}_gaf.png"
+                
+                if img_path.exists():
+                    try:
+                        # Load and transform immediately
+                        with Image.open(img_path).convert('RGB') as img:
+                            tensor_img = transform(img)
+                            self.img_tensors.append(tensor_img)
+                            self.valid_indices.append(i)
+                    except Exception as e:
+                        pass # Skip corrupt images
+
+            # Stack images into a single massive tensor (N, 3, 224, 224)
+            if len(self.img_tensors) > 0:
+                self.img_tensors = torch.stack(self.img_tensors)
+                print(f"   ✅ Loaded {len(self.img_tensors)} images into RAM (~{self.img_tensors.element_size() * self.img_tensors.numel() / 1024**2:.2f} MB)")
+            else:
+                print("   ❌ No images loaded!")
 
         def __len__(self):
             return len(self.valid_indices)
 
         def __getitem__(self, idx):
+            # No disk I/O here! Just array slicing.
             i = self.valid_indices[idx]
             
             # Numerical Input
             x_num = self.features[i-self.seq_len : i]
             
-            # Image Input
-            date_str = self.index_dates[i].strftime('%Y-%m-%d')
-            img_path = self.img_dir / f"{date_str}.png"
-            if not img_path.exists():
-                img_path = self.img_dir / f"{date_str}_gaf.png"
-                
-            image = Image.open(img_path).convert('RGB')
-            x_img = self.transform(image)
+            # Image Input (Already in RAM)
+            x_img = self.img_tensors[idx]
             
             # Target
             y = self.targets[i]
             
-            return torch.tensor(x_num), x_img, torch.tensor(y)
+            return x_num, x_img, y
 
         def get_input_dim(self):
             return self.features.shape[1]
 
     # --- Training Config ---
-    BATCH_SIZE = 32
+    BATCH_SIZE = 1024
     EPOCHS = 30
     LR = 0.0005
     SEQ_LEN = 60
@@ -206,9 +221,9 @@ def train_remote(target_stocks):
             print("❌ No aligned data. Check image generation.")
             continue
             
-        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
-        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
+        train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+        val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+        test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
         
         # Model Init
         model = TrimodalNetwork(num_input_dim=train_ds.get_input_dim()).cuda()
