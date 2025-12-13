@@ -23,37 +23,32 @@ class VectorizedBacktester:
         self.data['Actual_Return'] = np.log(self.data['Price'] / self.data['Price'].shift(1))
         self.cost = transaction_cost
 
-    def run_strategy(self, threshold=0.0005):
+    def run_strategy(self, threshold=0.002): # Increased threshold
         """
-        Runs a Long-Short strategy based on the signal strength.
+        Runs a Long-Only strategy (Buy or Cash).
         """
         df = self.data.copy()
         
-        # --- STRATEGY LOGIC ---
+        # --- NEW STRATEGY LOGIC (Long-Only) ---
         # 1. Define Position
-        # If model says return > 0.05% -> Buy (+1)
-        # If model says return < -0.05% -> Sell (-1)
-        # Otherwise -> Cash (0)
+        # If signal > threshold -> Buy (1)
+        # If signal < threshold -> Cash (0) - NO SHORTING
         df['Position'] = 0
         df.loc[df['Pred_Signal'] > threshold, 'Position'] = 1
-        df.loc[df['Pred_Signal'] < -threshold, 'Position'] = -1
         
-        # 2. Shift Position
-        # We compute signal at close of day 't', so we enter position at 't+1'
+        # 2. Shift Position (Enter at t+1 based on signal at t)
         df['Position'] = df['Position'].shift(1)
         
         # 3. Calculate Strategy Returns
-        # Strategy = Position * Market_Return
         df['Strat_Return'] = df['Position'] * df['Actual_Return']
         
-        # 4. Transaction Costs
-        # We pay cost whenever Position changes (e.g., 0 to 1, or 1 to -1)
+        # 4. Transaction Costs (Only pay when changing state)
         df['Trades'] = df['Position'].diff().abs()
         df['Strat_Return_Net'] = df['Strat_Return'] - (df['Trades'] * self.cost)
         
-        # 5. Cumulative Returns (Equity Curve)
-        df['Cum_BnH'] = df['Actual_Return'].cumsum().apply(np.exp) # Buy and Hold
-        df['Cum_Strat'] = df['Strat_Return_Net'].cumsum().apply(np.exp) # Your Model
+        # 5. Cumulative Returns
+        df['Cum_BnH'] = df['Actual_Return'].cumsum().apply(np.exp)
+        df['Cum_Strat'] = df['Strat_Return_Net'].cumsum().apply(np.exp)
         
         self.results = df.dropna()
         return self.results
