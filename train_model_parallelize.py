@@ -79,6 +79,8 @@ def train_remote(target_stocks):
     import torch.optim as optim
     from torch.utils.data import Dataset, DataLoader
     import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.metrics import confusion_matrix
     import numpy as np
     import pandas as pd
     from PIL import Image
@@ -89,23 +91,91 @@ def train_remote(target_stocks):
     from src.models.trimodal import TrimodalNetwork
     from src.utils.visualizer import Visualizer
     from src.models.trimodal import DirectionalLoss
-    from src.utils.visualize_Res import visualize_results
+
+    # --- DEFINING VISUALIZATION FUNCTION ---
+    def visualize_results(ticker, true_prices, pred_prices, save_dir='plots'):
+        """
+        Generates a 3-panel dashboard to diagnose the Directional Accuracy.
+        """
+        # Ensure inputs are flat numpy arrays
+        if isinstance(true_prices, torch.Tensor):
+            true_prices = true_prices.detach().cpu().numpy().flatten()
+        if isinstance(pred_prices, torch.Tensor):
+            pred_prices = pred_prices.detach().cpu().numpy().flatten()
+            
+        # Calculate Returns (percentage change) for analysis
+        # We use [1:] because we need a previous day to calc return
+        # Add epsilon to avoid division by zero
+        true_returns = np.diff(true_prices) / (true_prices[:-1] + 1e-9)
+        pred_returns = np.diff(pred_prices) / (pred_prices[:-1] + 1e-9)
+        
+        # Calculate Directions (1 for Up, 0 for Down)
+        true_dir = (true_returns > 0).astype(int)
+        pred_dir = (pred_returns > 0).astype(int)
+
+        # --- PLOTTING ---
+        fig = plt.figure(figsize=(20, 10))
+        fig.suptitle(f'Trimodal Model Diagnostics: {ticker}', fontsize=16, fontweight='bold')
+
+        # 1. Price Comparison (Zoomed into last 100 points)
+        ax1 = fig.add_subplot(2, 2, 1)
+        zoom = 100 
+        ax1.plot(true_prices[-zoom:], label='Actual Price', color='blue', linewidth=2, alpha=0.7)
+        ax1.plot(pred_prices[-zoom:], label='Predicted Price', color='red', linestyle='--', linewidth=2, alpha=0.8)
+        ax1.set_title(f'Price Action Lag Check (Last {zoom} Days)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # 2. Directional Confusion Matrix
+        ax2 = fig.add_subplot(2, 2, 2)
+        cm = confusion_matrix(true_dir, pred_dir)
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax2, 
+                    xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
+        ax2.set_xlabel('Predicted')
+        ax2.set_ylabel('Actual')
+        ax2.set_title(f'Directional Accuracy Confusion Matrix\n(Total Acc: {np.mean(true_dir == pred_dir):.2%})')
+
+        # 3. Returns Scatter Plot
+        ax3 = fig.add_subplot(2, 1, 2)
+        ax3.scatter(true_returns, pred_returns, alpha=0.5, color='purple')
+        ax3.axhline(0, color='black', linestyle='--', linewidth=1)
+        ax3.axvline(0, color='black', linestyle='--', linewidth=1)
+        ax3.set_xlabel('Actual Returns')
+        ax3.set_ylabel('Predicted Returns')
+        ax3.set_title('Returns Correlation (Target: Top-Right & Bottom-Left Quadrants)')
+        ax3.grid(True, alpha=0.3)
+
+        # Quadrant Labels
+        if len(true_returns) > 0 and len(pred_returns) > 0:
+            ax3.text(max(true_returns)*0.7, max(pred_returns)*0.7, 'Correct UP', color='green', fontweight='bold')
+            ax3.text(min(true_returns)*0.7, min(pred_returns)*0.7, 'Correct DOWN', color='green', fontweight='bold')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = f"{save_dir}/{ticker}_diagnostics.png"
+        plt.savefig(save_path)
+        print(f"📊 Visualization saved to: {save_path}")
+        plt.close()
+
     print(f"🚀 Starting TRIMODAL Training (Unified Pipeline) on {torch.cuda.get_device_name(0)}")
     
-    # --- Dataset Definition (Preserving logic from both versions) ---
-    # --- Optimized Dataset (Pre-loads to RAM) ---
+    # --- Dataset Definition ---
     class TrimodalDataset(Dataset):
         def __init__(self, df, img_dir, sequence_length=60, target_col='Target_Return'):
             self.seq_len = sequence_length
             
             # 1. Prepare Numerical Data
-            drop_cols = [target_col, 'Target_Close', 'Unnamed: 0']
+            drop_cols = [target_col, 'Target_Close', 'Unnamed: 0', 'Date']
             feature_cols = [c for c in df.columns if c not in drop_cols]
+            
             self.features = torch.tensor(df[feature_cols].values, dtype=torch.float32)
             self.targets = torch.tensor(df[target_col].values, dtype=torch.float32)
+            # Store raw close prices for reconstruction
+            self.raw_prices = torch.tensor(df['Close'].values, dtype=torch.float32)
             self.index_dates = df.index
             
-            # 2. Pre-load Images into RAM (The Speedup Fix)
+            # 2. Pre-load Images into RAM
             print(f"   ⚡ Pre-loading images into RAM for speed...")
             self.img_tensors = []
             self.valid_indices = []
@@ -118,29 +188,24 @@ def train_remote(target_stocks):
             
             img_dir_path = Path(img_dir)
             
-            # Loop once and cache everything
             for i in range(self.seq_len, len(df)):
                 date_str = self.index_dates[i].strftime('%Y-%m-%d')
-                
-                # Check for image existence
                 img_path = img_dir_path / f"{date_str}.png"
                 if not img_path.exists():
                     img_path = img_dir_path / f"{date_str}_gaf.png"
                 
                 if img_path.exists():
                     try:
-                        # Load and transform immediately
                         with Image.open(img_path).convert('RGB') as img:
                             tensor_img = transform(img)
                             self.img_tensors.append(tensor_img)
                             self.valid_indices.append(i)
                     except Exception as e:
-                        pass # Skip corrupt images
+                        pass 
 
-            # Stack images into a single massive tensor (N, 3, 224, 224)
             if len(self.img_tensors) > 0:
                 self.img_tensors = torch.stack(self.img_tensors)
-                print(f"   ✅ Loaded {len(self.img_tensors)} images into RAM (~{self.img_tensors.element_size() * self.img_tensors.numel() / 1024**2:.2f} MB)")
+                print(f"   ✅ Loaded {len(self.img_tensors)} images into RAM")
             else:
                 print("   ❌ No images loaded!")
 
@@ -148,19 +213,17 @@ def train_remote(target_stocks):
             return len(self.valid_indices)
 
         def __getitem__(self, idx):
-            # No disk I/O here! Just array slicing.
             i = self.valid_indices[idx]
             
-            # Numerical Input
             x_num = self.features[i-self.seq_len : i]
-            
-            # Image Input (Already in RAM)
             x_img = self.img_tensors[idx]
+            y = self.targets[i] # This is now Log Return
             
-            # Target
-            y = self.targets[i]
+            # Pass current price (Price at time t) for reconstruction
+            # i is the target index (t+1), so i-1 is current time t
+            current_price = self.raw_prices[i-1] 
             
-            return x_num, x_img, y
+            return x_num, x_img, y, current_price
 
         def get_input_dim(self):
             return self.features.shape[1]
@@ -176,7 +239,7 @@ def train_remote(target_stocks):
 
     for ticker in target_stocks:
         print(f"\n{'='*60}")
-        print(f"👁️ TRIMODAL TRAINING + RECONSTRUCTION: {ticker}")
+        print(f"👁️ TRIMODAL TRAINING + RECONSTRUCTION (LOG RETURNS): {ticker}")
         print(f"{'='*60}")
         
         stock_dir = REMOTE_DATA_PATH / ticker
@@ -185,21 +248,23 @@ def train_remote(target_stocks):
         
         if not csv_path.exists(): continue
             
-        # 1. ROBUST PRE-PROCESSING (From Old Version)
+        # 1. PRE-PROCESSING
         df = pd.read_csv(csv_path)
         if 'Date' in df.columns:
             df['Date'] = pd.to_datetime(df['Date'])
             df.set_index('Date', inplace=True)
             
-        # Recalculate Log Returns
-        price_ratio = df['Close'].shift(-1) / df['Close']
-        valid_mask = (price_ratio > 0) & (price_ratio.notna())
-        df['Target_Return'] = 0.0
-        df.loc[valid_mask, 'Target_Return'] = np.log(price_ratio[valid_mask])
-        df['Target_Return'] = df['Target_Return'].replace([np.inf, -np.inf], 0.0)
-        df.dropna(inplace=True)
+        # --- NEW TARGET: LOG RETURNS (WITH FIX) ---
+        # Formula: ln(Price_{t+1} / Price_t)
+        # Shift(-1) aligns row t with return at t+1
+        # ADDED: np.maximum(..., 1e-9) protects against log(0)
+        df['Target_Return'] = np.log((df['Close'] / df['Close'].shift(1)).replace(0, np.nan)).shift(-1)
         
-        # 2. TIME-SERIES SPLIT (From Old Version - No Random Split!)
+        # FIX: Replace infinities with NaN and drop them before scaling
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.dropna(inplace=True) 
+        
+        # 2. TIME-SERIES SPLIT
         train_size = int(len(df) * 0.7)
         val_size = int(len(df) * 0.15)
         
@@ -207,13 +272,13 @@ def train_remote(target_stocks):
         val_df = df.iloc[train_size : train_size + val_size].copy()
         test_df = df.iloc[train_size + val_size :].copy()
         
-        # 3. ROBUST SCALING (From Old Version)
+        # 3. ROBUST SCALING
         target_scaler = RobustScaler()
         train_df['Target_Return'] = target_scaler.fit_transform(train_df[['Target_Return']])
         val_df['Target_Return'] = target_scaler.transform(val_df[['Target_Return']])
         test_df['Target_Return'] = target_scaler.transform(test_df[['Target_Return']])
         
-        # Initialize Datasets with Split DataFrames
+        # Initialize Datasets
         train_ds = TrimodalDataset(train_df, str(img_dir), SEQ_LEN)
         val_ds = TrimodalDataset(val_df, str(img_dir), SEQ_LEN)
         test_ds = TrimodalDataset(test_df, str(img_dir), SEQ_LEN)
@@ -236,7 +301,7 @@ def train_remote(target_stocks):
             model.train()
             train_losses = []
             
-            for x_num, x_img, y in train_loader:
+            for x_num, x_img, y, _ in train_loader: # Unpack current_price but ignore for training
                 x_num, x_img, y = x_num.cuda(), x_img.cuda(), y.float().cuda().unsqueeze(1)
                 optimizer.zero_grad()
                 preds, gates = model(x_num, x_img)
@@ -252,7 +317,7 @@ def train_remote(target_stocks):
             last_gates = None
             
             with torch.no_grad():
-                for x_num, x_img, y in val_loader:
+                for x_num, x_img, y, _ in val_loader:
                     x_num, x_img, y = x_num.cuda(), x_img.cuda(), y.float().cuda().unsqueeze(1)
                     preds, gates = model(x_num, x_img)
                     val_losses.append(criterion(preds, y).item())
@@ -264,62 +329,60 @@ def train_remote(target_stocks):
             avg_val = np.mean(val_losses)
             r2 = r2_score(all_val_targets, all_val_preds)
             
-            print(f"   Epoch {epoch+1}/{EPOCHS} | Loss: {avg_train:.5f} | Val: {avg_val:.5f} | R2: {r2:.4f}")
+            print(f"   Epoch {epoch+1}/{EPOCHS} | Loss: {avg_train:.5f} | Val: {avg_val:.5f} | R2 (Returns): {r2:.4f}")
             viz.log_step(epoch, avg_train, avg_val, r2, last_gates)
 
         # Save Model & Gate Plots
         torch.save(model.state_dict(), REMOTE_MODEL_PATH / f"{ticker}_trimodal.pth")
         viz.save_reports(ticker)
         
-        # --- 4. PRICE RECONSTRUCTION & METRICS (From Old Version) ---
-        print("📊 Final Evaluation: Reconstructing Price...")
+        # --- 4. PRICE RECONSTRUCTION & METRICS ---
+        print("📊 Final Evaluation: Reconstructing Price from Log Returns...")
         model.eval()
         
-        val_predictions = []
-        val_targets = []
-        pred_returns_scaled = []
+        all_pred_prices = []
+        all_true_prices = []
+        
         with torch.no_grad():
-            for x_num, x_img, _ in test_loader:
+            for x_num, x_img, y, current_prices in test_loader:
                 x_num, x_img = x_num.cuda(), x_img.cuda()
+                current_prices = current_prices.cuda()
+                y = y.cuda()
+                
+                # Get Predicted Log Return (Scaled)
                 preds, _ = model(x_num, x_img)
-                pred_returns_scaled.extend(preds.cpu().numpy().flatten())
-                val_predictions.append(outputs.cpu())
-                val_targets.append(targets.cpu())
-        val_predictions = torch.cat(val_predictions).numpy()
-        val_targets = torch.cat(val_targets).numpy()
-        # Inverse Scale Returns
-        pred_log_returns = target_scaler.inverse_transform(np.array(pred_returns_scaled).reshape(-1, 1)).flatten()
-        
-        # Align Prices
-        # We need the 'Close' prices corresponding to the start of the prediction interval
-        # The test_loader iterates over valid indices. We need to map those back to df.
-        test_indices = test_ds.valid_indices
-        base_prices = test_df['Close'].iloc[[i-1 for i in test_indices]].values # Price at t
-        actual_future_prices = test_df['Close'].iloc[test_indices].values       # Price at t+1
-        
-        # Apply Returns: P_t+1 = P_t * exp(return)
-        predicted_prices = base_prices * np.exp(pred_log_returns)
+                preds_np = preds.cpu().numpy().flatten()
+                
+                # Inverse Scale Returns
+                pred_log_returns = target_scaler.inverse_transform(preds_np.reshape(-1, 1)).flatten()
+                true_log_returns = target_scaler.inverse_transform(y.cpu().numpy().reshape(-1, 1)).flatten()
+                
+                # Formula: Price_{t+1} = Price_t * exp(Log_Return)
+                current_prices_np = current_prices.cpu().numpy()
+                
+                batch_pred_prices = current_prices_np * np.exp(pred_log_returns)
+                batch_true_prices = current_prices_np * np.exp(true_log_returns)
+                
+                all_pred_prices.extend(batch_pred_prices)
+                all_true_prices.extend(batch_true_prices)
+
+        # Convert to numpy for metrics
+        all_pred_prices = np.array(all_pred_prices)
+        all_true_prices = np.array(all_true_prices)
         
         # Metrics
-        final_r2 = r2_score(actual_future_prices, predicted_prices)
-        final_rmse = np.sqrt(mean_squared_error(actual_future_prices, predicted_prices))
+        final_r2 = r2_score(all_true_prices, all_pred_prices)
+        final_rmse = np.sqrt(mean_squared_error(all_true_prices, all_pred_prices))
         
-        # Directional Accuracy
-        actual_move = np.sign(actual_future_prices - base_prices)
-        pred_move = np.sign(predicted_prices - base_prices)
-        dir_acc = accuracy_score(actual_move, pred_move)
+        # Directional Accuracy (re-calculating returns for precision)
+        true_returns_unscaled = target_scaler.inverse_transform(test_df['Target_Return'].values[:len(all_true_prices)].reshape(-1,1)).flatten()
         
-        # Plotting
-        plt.figure(figsize=(12, 6))
-        plt.plot(actual_future_prices, label='Actual', alpha=0.6, color='black')
-        plt.plot(predicted_prices, label='Predicted (Trimodal)', alpha=0.8, color='blue')
-        plt.title(f"{ticker}: Trimodal Price Prediction (Acc: {dir_acc:.2%})")
-        plt.legend()
-        plt.savefig(REMOTE_MODEL_PATH / f"{ticker}_price_reconstruction.png")
-        plt.close()
+        dir_acc = accuracy_score((all_true_prices > (all_true_prices / np.exp(true_returns_unscaled))).astype(int), 
+                                 (all_pred_prices > (all_true_prices / np.exp(true_returns_unscaled))).astype(int))
 
-        print(f"generating graphs for {ticker_name}...")
-        visualize_results(ticker_name,val_targets,val_predictions,save_dir="experiment_plots")
+        # --- CALL VISUALIZATION FUNCTION ---
+        print(f"📊 Generating Graphs for {ticker}...")
+        visualize_results(ticker, all_true_prices, all_pred_prices, save_dir=str(REMOTE_MODEL_PATH))
         
         print(f"✅ {ticker} FINAL RESULTS:")
         print(f"   R2 (Price): {final_r2:.4f}")
