@@ -88,7 +88,8 @@ def train_remote(target_stocks):
     
     from src.models.trimodal import TrimodalNetwork
     from src.utils.visualizer import Visualizer
-
+    from src.models.trimodal import DirectionalLoss
+    from src.utils.visualize_Res import visualize_results
     print(f"🚀 Starting TRIMODAL Training (Unified Pipeline) on {torch.cuda.get_device_name(0)}")
     
     # --- Dataset Definition (Preserving logic from both versions) ---
@@ -227,7 +228,7 @@ def train_remote(target_stocks):
         
         # Model Init
         model = TrimodalNetwork(num_input_dim=train_ds.get_input_dim()).cuda()
-        criterion = nn.MSELoss()
+        criterion = DirectionalLoss(lambda_reg=1.0)
         optimizer = optim.Adam(model.parameters(), lr=LR)
         
         # --- TRAINING LOOP ---
@@ -274,13 +275,18 @@ def train_remote(target_stocks):
         print("📊 Final Evaluation: Reconstructing Price...")
         model.eval()
         
+        val_predictions = []
+        val_targets = []
         pred_returns_scaled = []
         with torch.no_grad():
             for x_num, x_img, _ in test_loader:
                 x_num, x_img = x_num.cuda(), x_img.cuda()
                 preds, _ = model(x_num, x_img)
                 pred_returns_scaled.extend(preds.cpu().numpy().flatten())
-        
+                val_predictions.append(outputs.cpu())
+                val_targets.append(targets.cpu())
+        val_predictions = torch.cat(val_predictions).numpy()
+        val_targets = torch.cat(val_targets).numpy()
         # Inverse Scale Returns
         pred_log_returns = target_scaler.inverse_transform(np.array(pred_returns_scaled).reshape(-1, 1)).flatten()
         
@@ -311,6 +317,9 @@ def train_remote(target_stocks):
         plt.legend()
         plt.savefig(REMOTE_MODEL_PATH / f"{ticker}_price_reconstruction.png")
         plt.close()
+
+        print(f"generating graphs for {ticker_name}...")
+        visualize_results(ticker_name,val_targets,val_predictions,save_dir="experiment_plots")
         
         print(f"✅ {ticker} FINAL RESULTS:")
         print(f"   R2 (Price): {final_r2:.4f}")
